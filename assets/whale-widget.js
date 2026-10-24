@@ -1342,7 +1342,8 @@ img.className = 'dshwv-img'
 var initRoleUrl = IMG_URL
 try {
   var initRoleId = localStorage.getItem('dshw-role') || ''
-  if (initRoleId && initRoleId !== 'default') initRoleUrl = '/dsh-whale/role-image.png?id=' + encodeURIComponent(initRoleId)
+  if (initRoleId === 'whale3d') initRoleUrl = '/dsh-whale/whale-3d-thumb.png'
+  else if (initRoleId && initRoleId !== 'default') initRoleUrl = '/dsh-whale/role-image.png?id=' + encodeURIComponent(initRoleId)
 } catch (err) {}
 img.src = initRoleUrl
 img.alt = 'DeepSeek 余额'
@@ -13540,7 +13541,7 @@ function confirmGifRole() {
           for (var i = 0; i < roleList.length; i++) {
             if (roleList[i].id !== 'default' && (!newest || roleList[i].createdAt > newest.createdAt)) newest = roleList[i]
           }
-          if (newest) applyRole(newest.id, newest.name, roleUrl(newest.id))
+          if (newest) applyRole(newest.id, newest.name, roleUrl(newest.id), newest.format, newest.modelUrl)
         }
       })
       .catch(function () {})
@@ -19987,7 +19988,7 @@ function loadRoles() {
         }
         if (found) {
           // 角色仍在：若初始已按此角色渲染（initRoleUrl 一致）则不重复切换，只补全 name/panel
-          if (currentRole.id !== found.id) applyRole(found.id, found.name, found.url)
+          if (currentRole.id !== found.id) applyRole(found.id, found.name, found.url, found.format, found.modelUrl)
           else renderRolePanel()
         } else if (saved && saved !== 'default') {
           // 保存的角色已被删除：回退默认鲸鱼娘
@@ -20085,19 +20086,444 @@ function makeNameCell(className, text) {
   outer.appendChild(inner)
   return outer
 }
-function applyRole(id, name, url) {
-  currentRole = { id: id, name: name, url: url }
-  img.src = url
+// ===== 3D 角色（A 方案）=====
+// 设计要点（为什么这么接）：
+//  1) 只有用户真的切到 format:'glb' 的角色时才拉 733KB 运行时 —— PNG 用户零成本；
+//  2) canvas 复用 .dshwv-img 的定位/尺寸规则（右下角 59.45%），⇒ 泡泡锚点、整体缩放、
+//     scaleX(-1) 翻转、按压时 .dshwv-body 的形变**全部**沿用现有逻辑，一处都不用改；
+//  3) <img> 不删除，只 visibility:hidden —— 它的 getBoundingClientRect 仍是所有定位的基准，
+//     隐藏后依然返回原尺寸（这是我们能"零布局改动"的前提）；
+//  4) 透明区穿透沿用凸包 clip-path，只是凸包来源从 2D 命中图换成渲染帧的 alpha；
+//  5) WebGL / three / 模型任一环节失败 ⇒ 静默退回 PNG，绝不弹错、绝不留一个黑洞。
+var THREE_JS_VER = '1'
+var whale3d = {
+  active: false,
+  loading: false,
+  waiters: [],
+  canvas: null,
+  renderer: null,
+  scene: null,
+  camera: null,
+  holder: null,
+  loadedUrl: '',
+  hull: null,
+  needRender: true,
+  rafing: false,
+  yaw: 0.22, pitch: 0.04,
+  targetYaw: 0.22, targetPitch: 0.04,
+  BASE_YAW: 0.22, BASE_PITCH: 0.04,
+  // Alt + 滚轮缩放视角：只动相机距离，不动挂件尺寸（尺寸仍归「大小」滑块管）
+  zoom: 1, targetZoom: 1, baseDist: 0,
+  ZOOM_MIN: 0.55, ZOOM_MAX: 1.6,
+  altDown: false,
+  drag: null,
+  lastHitAt: 0,
+  hitCanvas: null,
+  hitCtx: null
+}
+
+function dshw3dLoadScript(cb) {
+  if (window.__DSHW3D) { try { cb(true) } catch (err) {} return }
+  whale3d.waiters.push(cb)
+  if (whale3d.loading) return
+  whale3d.loading = true
+  var finish = function (ok) {
+    whale3d.loading = false
+    var list = whale3d.waiters
+    whale3d.waiters = []
+    for (var i = 0; i < list.length; i++) { try { list[i](ok) } catch (err) {} }
+  }
+  try {
+    var s = document.createElement('script')
+    s.src = '/dsh-whale/three.js?v=' + THREE_JS_VER
+    s.onload = function () { finish(!!window.__DSHW3D) }
+    s.onerror = function () { finish(false) }
+    document.head.appendChild(s)
+  } catch (err) { finish(false) }
+}
+
+// 复用 .dshwv-img 的样式：位置/尺寸/pointer-events 与 <img> 完全一致，只是叠在它上面
+function dshw3dCanvas() {
+  if (whale3d.canvas) return whale3d.canvas
+  var c = document.createElement('canvas')
+  c.className = 'dshwv-img dshwv-gl'
+  c.style.display = 'none'
+  c.style.touchAction = 'none'
+  body.appendChild(c)
+  whale3d.canvas = c
+  bindWhale3dPointer(c)
+  return c
+}
+
+function dshw3dStop() {
+  whale3d.active = false
+  whale3d.loadedUrl = ''
+  whale3d.hull = null
+  whale3d.drag = null
+  if (whale3d.canvas) {
+    whale3d.canvas.style.display = 'none'
+    whale3d.canvas.style.clipPath = ''
+    whale3d.canvas.style.webkitClipPath = ''
+  }
+  try { img.style.visibility = '' } catch (err) {}
+}
+
+function dshw3dResize() {
+  if (!whale3d.active || !whale3d.renderer || !whale3d.camera) return
+  try {
+    var r = img.getBoundingClientRect()
+    var w = Math.max(1, Math.round(r.width))
+    var h = Math.max(1, Math.round(r.height))
+    var dpr = Math.min(window.devicePixelRatio || 1, 2)
+    whale3d.renderer.setPixelRatio(dpr)
+    whale3d.renderer.setSize(w, h, false)
+    whale3d.camera.aspect = w / h
+    whale3d.camera.updateProjectionMatrix()
+    whale3d.needRender = true
+    dshw3dKick()
+  } catch (err) {}
+}
+
+function dshw3dKick() {
+  if (whale3d.rafing || !whale3d.active) return
+  whale3d.rafing = true
+  try { requestAnimationFrame(dshw3dFrame) } catch (err) { whale3d.rafing = false }
+}
+
+function dshw3dFrame() {
+  whale3d.rafing = false
+  if (!whale3d.active || !whale3d.renderer) return
+  if (document.hidden) return
+  var moving = false
+  try {
+    var dy = whale3d.targetYaw - whale3d.yaw
+    var dp = whale3d.targetPitch - whale3d.pitch
+    if (Math.abs(dy) > 1e-4 || Math.abs(dp) > 1e-4) {
+      whale3d.yaw += dy * 0.2
+      whale3d.pitch += dp * 0.2
+      moving = true
+    }
+    if (whale3d.holder) {
+      whale3d.holder.rotation.y = whale3d.yaw
+      whale3d.holder.rotation.x = whale3d.pitch
+    }
+    var dz = whale3d.targetZoom - whale3d.zoom
+    if (Math.abs(dz) > 1e-4) {
+      whale3d.zoom += dz * 0.22
+      moving = true
+      if (whale3d.camera && whale3d.baseDist) {
+        // 沿视线推拉：y 同步按比例缩放，镜头才始终对着模型中心
+        whale3d.camera.position.z = whale3d.baseDist * whale3d.zoom
+        whale3d.camera.position.y = 0.86 * 0.52 * whale3d.zoom
+        whale3d.camera.lookAt(0, 0.86 * 0.5, 0)
+      }
+    }
+  } catch (err) {}
+  if (!whale3d.needRender && !moving) return
+  whale3d.needRender = false
+  try {
+    whale3d.renderer.render(whale3d.scene, whale3d.camera)
+    var now = performance.now()
+    // 凸包重算要读回整帧像素（1~3ms），拖拽中限流到 200ms 一次足够
+    if (now - whale3d.lastHitAt > 200) { whale3d.lastHitAt = now; dshw3dBuildHull() }
+  } catch (err) {}
+  if (moving) dshw3dKick()
+}
+
+function dshw3dBuildHull() {
+  try {
+    var c = whale3d.canvas
+    if (!c) return
+    if (!whale3d.hitCanvas) {
+      whale3d.hitCanvas = document.createElement('canvas')
+      whale3d.hitCanvas.width = whale3d.hitCanvas.height = 256
+      whale3d.hitCtx = whale3d.hitCanvas.getContext('2d', { willReadFrequently: true })
+    }
+    var ctx = whale3d.hitCtx
+    if (!ctx) return
+    ctx.clearRect(0, 0, 256, 256)
+    ctx.drawImage(c, 0, 0, 256, 256)
+    var data = ctx.getImageData(0, 0, 256, 256).data
+    var pts = []
+    for (var y = 0; y < 256; y++) {
+      var l = -1, r = -1
+      var base = y * 256 * 4
+      for (var x = 0; x < 256; x++) {
+        if (data[base + x * 4 + 3] > 12) { if (l < 0) l = x; r = x }
+      }
+      if (l >= 0) { pts.push([l, y]); pts.push([r, y]) }
+    }
+    if (pts.length < 8) return
+    var hull = dshw3dConvexHull(pts)
+    if (!hull || hull.length < 3) return
+    var norm = []
+    var parts = []
+    for (var k = 0; k < hull.length; k++) {
+      var nx = hull[k][0] / 256
+      var ny = hull[k][1] / 256
+      norm.push([nx, ny])
+      parts.push((nx * 100).toFixed(2) + '% ' + (ny * 100).toFixed(2) + '%')
+    }
+    whale3d.hull = norm
+    c.style.clipPath = 'polygon(' + parts.join(',') + ')'
+    c.style.webkitClipPath = c.style.clipPath
+  } catch (err) {}
+}
+
+function dshw3dConvexHull(pts) {
+  try {
+    var p = pts.slice().sort(function (a, b) { return a[0] - b[0] || a[1] - b[1] })
+    if (p.length < 3) return null
+    var cross = function (o, a, b) { return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]) }
+    var lower = [], upper = [], i
+    for (i = 0; i < p.length; i++) {
+      while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p[i]) <= 0) lower.pop()
+      lower.push(p[i])
+    }
+    for (i = p.length - 1; i >= 0; i--) {
+      while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p[i]) <= 0) upper.pop()
+      upper.push(p[i])
+    }
+    lower.pop(); upper.pop()
+    return lower.concat(upper)
+  } catch (err) { return null }
+}
+
+// 3D 模式的命中判定：凸包多边形（比逐像素读便宜，且拿到的就是屏幕上看到的轮廓）
+function dshw3dHit(e) {
+  var h = whale3d.hull
+  if (!h || h.length < 3) return false
+  try {
+    var r = img.getBoundingClientRect()
+    if (!r || r.width <= 0 || r.height <= 0) return false
+    var x = (e.clientX - r.left) / r.width
+    var y = (e.clientY - r.top) / r.height
+    if (x < 0 || y < 0 || x > 1 || y > 1) return false
+    if (state.flip) x = 1 - x
+    var inside = false
+    for (var i = 0, j = h.length - 1; i < h.length; j = i++) {
+      var xi = h[i][0], yi = h[i][1], xj = h[j][0], yj = h[j][1]
+      if (((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) inside = !inside
+    }
+    return inside
+  } catch (err) { return false }
+}
+
+// Alt 的按下状态自己记一份：个别浏览器/输入法把 wheel 事件的 altKey 吞掉时，
+// 光看 e.altKey 会表现为"Alt + 滚轮没反应"，这里做双保险。
+try {
+  document.addEventListener('keydown', function (e) { if (e.key === 'Alt') whale3d.altDown = true }, true)
+  document.addEventListener('keyup', function (e) { if (e.key === 'Alt') whale3d.altDown = false }, true)
+  window.addEventListener('blur', function () { whale3d.altDown = false })
+} catch (err) {}
+
+function bindWhale3dPointer(c) {
+  // Alt + 拖拽 = 旋转模型。用 pointer capture 保证移出画布也能继续跟手。
+  c.addEventListener('pointerdown', function (e) {
+    if (!whale3d.active || !(e.altKey || whale3d.altDown)) return
+    try {
+      e.preventDefault()
+      e.stopPropagation()
+      c.setPointerCapture(e.pointerId)
+    } catch (err) {}
+    whale3d.drag = {
+      x: e.clientX, y: e.clientY,
+      yaw: whale3d.targetYaw, pitch: whale3d.targetPitch
+    }
+    c.style.cursor = 'grabbing'
+  })
+  c.addEventListener('pointermove', function (e) {
+    if (!whale3d.active || !whale3d.drag) return
+    try { e.preventDefault(); e.stopPropagation() } catch (err) {}
+    var dx = e.clientX - whale3d.drag.x
+    var dy = e.clientY - whale3d.drag.y
+    whale3d.targetYaw = whale3d.drag.yaw + dx * 0.012
+    whale3d.targetPitch = Math.max(-0.55, Math.min(0.55, whale3d.drag.pitch + dy * 0.008))
+    whale3d.needRender = true
+    dshw3dKick()
+  })
+  function endRotate(e) {
+    if (!whale3d.drag) return
+    whale3d.drag = null
+    try { c.style.cursor = '' } catch (err) {}
+    whale3d.needRender = true
+    dshw3dKick()
+  }
+  c.addEventListener('pointerup', endRotate)
+  c.addEventListener('pointercancel', endRotate)
+  // Alt + 滚轮 = 缩放视角（只改相机距离）。
+  // 不带 Alt 时**绝不拦**：让它冒泡到 root 上的 onWhaleWheel，照常转交给页面滚动。
+  c.addEventListener('wheel', function (e) {
+    if (!whale3d.active || !(e.altKey || whale3d.altDown)) return
+    try { e.preventDefault(); e.stopPropagation() } catch (err) {}
+    // deltaMode: 0=像素 1=行 2=页 —— 归一化成像素量，否则行模式下滚一格几乎没反应
+    var d = e.deltaY * (e.deltaMode === 1 ? 16 : (e.deltaMode === 2 ? 100 : 1))
+    if (!d) return
+    var next = whale3d.targetZoom * Math.exp(-d * 0.0015)
+    whale3d.targetZoom = Math.max(whale3d.ZOOM_MIN, Math.min(whale3d.ZOOM_MAX, next))
+    whale3d.needRender = true
+    dshw3dKick()
+  }, { passive: false })
+
+  // 双击复位（机位 + 缩放一起回默认；不动挂件位置）
+  c.addEventListener('dblclick', function (e) {
+    if (!whale3d.active) return
+    try { e.preventDefault(); e.stopPropagation() } catch (err) {}
+    whale3d.targetYaw = whale3d.BASE_YAW
+    whale3d.targetPitch = whale3d.BASE_PITCH
+    whale3d.targetZoom = 1
+    whale3d.needRender = true
+    dshw3dKick()
+  })
+}
+
+function dshw3dStart(modelUrl) {
+  if (!modelUrl) { dshw3dStop(); return }
+  var c = dshw3dCanvas()
+  dshw3dLoadScript(function (ok) {
+    if (!ok) { dshw3dStop(); return }
+    // 异步期间用户可能已经切回 PNG
+    if (!currentRole || currentRole.format !== 'glb' || currentRole.modelUrl !== modelUrl) return
+    dshw3dBoot(c, modelUrl)
+  })
+}
+
+function dshw3dBoot(c, modelUrl) {
+  try {
+    var T = window.__DSHW3D
+    if (!T || !T.THREE) { dshw3dStop(); return }
+    var THREE = T.THREE
+    if (!whale3d.renderer) {
+      var renderer = new THREE.WebGLRenderer({
+        canvas: c, alpha: true, antialias: true, premultipliedAlpha: true,
+        powerPreference: 'low-power'
+      })
+      renderer.setClearAlpha(0)
+      renderer.outputColorSpace = THREE.SRGBColorSpace
+      renderer.toneMapping = THREE.ACESFilmicToneMapping
+      renderer.toneMappingExposure = 1.05
+      var scene = new THREE.Scene()
+      var camera = new THREE.PerspectiveCamera(28, 1, 0.01, 40)
+      // 三光源足够还原 Q 版手办的体积感，且不用加载 HDRI（省一次网络请求）
+      scene.add(new THREE.HemisphereLight(0xffffff, 0xcfd8e6, 2.0))
+      var key = new THREE.DirectionalLight(0xfff6ea, 2.6)
+      key.position.set(1.8, 2.6, 2.4)
+      scene.add(key)
+      var fill = new THREE.DirectionalLight(0xc7dcff, 1.0)
+      fill.position.set(-2.4, 1.2, 1.6)
+      scene.add(fill)
+      var rim = new THREE.DirectionalLight(0xdce8ff, 1.2)
+      rim.position.set(0, 1.6, -2.6)
+      scene.add(rim)
+      whale3d.renderer = renderer
+      whale3d.scene = scene
+      whale3d.camera = camera
+    }
+    if (whale3d.loadedUrl === modelUrl && whale3d.holder) {
+      whale3d.active = true
+      c.style.display = ''
+      img.style.visibility = 'hidden'
+      dshw3dResize()
+      return
+    }
+    var loader = new T.GLTFLoader()
+    try { if (T.MeshoptDecoder) loader.setMeshoptDecoder(T.MeshoptDecoder) } catch (err) {}
+    loader.load(modelUrl, function (gltf) {
+      try {
+        // 下载期间用户可能已经切走：这次回调直接丢弃，别再抢回画面
+        if (!currentRole || currentRole.format !== 'glb' || currentRole.modelUrl !== modelUrl) return
+        if (whale3d.holder) {
+          try { whale3d.scene.remove(whale3d.holder) } catch (err) {}
+          whale3d.holder = null
+        }
+        var root = gltf.scene
+        var bbox = new THREE.Box3().setFromObject(root)
+        var size = bbox.getSize(new THREE.Vector3())
+        var center = bbox.getCenter(new THREE.Vector3())
+        var s = 0.86 / (size.y || 1)
+        root.scale.setScalar(s)
+        root.position.set(-center.x * s, -bbox.min.y * s, -center.z * s)
+        root.traverse(function (o) {
+          if (o.isMesh) {
+            var mats = Array.isArray(o.material) ? o.material : [o.material]
+            for (var i = 0; i < mats.length; i++) {
+              if (mats[i]) { mats[i].side = THREE.DoubleSide }
+            }
+          }
+        })
+        var holder = new THREE.Group()
+        holder.add(root)
+        whale3d.scene.add(holder)
+        whale3d.holder = holder
+        whale3d.loadedUrl = modelUrl
+        whale3d.yaw = whale3d.targetYaw = whale3d.BASE_YAW
+        whale3d.pitch = whale3d.targetPitch = whale3d.BASE_PITCH
+        holder.rotation.y = whale3d.yaw
+        holder.rotation.x = whale3d.pitch
+        // 相机按模型高度定距：模型归一化后高 0.86，fov 28
+        var dist = (0.86 * 0.5) / Math.tan(28 * Math.PI / 360) * 0.98
+        whale3d.baseDist = dist
+        whale3d.zoom = whale3d.targetZoom = 1
+        whale3d.camera.position.set(0, 0.86 * 0.52, dist)
+        whale3d.camera.lookAt(0, 0.86 * 0.5, 0)
+        whale3d.active = true
+        c.style.display = ''
+        img.style.visibility = 'hidden'
+        whale3d.needRender = true
+        dshw3dResize()
+      } catch (err) { dshw3dStop() }
+    }, undefined, function () { dshw3dStop() })
+  } catch (err) { dshw3dStop() }
+}
+
+// 调试出口（和 window.__dshWhaleRoot 同性质）：用于排查"3D 没出现"这类现场问题
+try { window.__dshWhale3d = whale3d } catch (err) {}
+
+// 尺寸变化（缩放滑块 / 窗口 resize / 吸附重排）统一由 img 的 ResizeObserver 驱动
+try {
+  if (typeof ResizeObserver === 'function') {
+    var whale3dRO = new ResizeObserver(function () { dshw3dResize() })
+    whale3dRO.observe(img)
+  }
+} catch (err) {}
+try {
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden && whale3d.active) { whale3d.needRender = true; dshw3dKick() }
+  })
+} catch (err) {}
+
+function applyRole(id, name, url, format, modelUrl) {
+  var fmt = format || (id === 'whale3d' ? 'glb' : 'png')
+  currentRole = {
+    id: id, name: name, url: url,
+    format: fmt,
+    modelUrl: modelUrl || (fmt === 'glb'
+      ? (id === 'whale3d' ? '/dsh-whale/whale-3d.glb?v=' + THREE_JS_VER : '')
+      : '')
+  }
   setRoleBtnText(name)
   try { localStorage.setItem('dshw-role', id) } catch (err) {}
-  hitReady = false
-  hitFailed = false
-  setupHitTest(url)
+  if (fmt === 'glb' && currentRole.modelUrl) {
+    // 3D：先让 <img> 顶上缩略图（模型 571KB + 运行时 733KB 要下载一会儿），
+    // 首帧渲染完成后 dshw3dBoot 才隐藏它 —— 避免切过去时出现空白方块。
+    img.src = url
+    hitReady = false
+    hitFailed = false
+    dshw3dStart(currentRole.modelUrl)
+  } else {
+    dshw3dStop()
+    img.src = url
+    hitReady = false
+    hitFailed = false
+    setupHitTest(url)
+  }
   closeRolePanel()
   renderRolePanel()
 }
 function roleUrl(id) {
   if (id === 'default') return IMG_URL
+  // 内置 3D 角色的"url"只是列表缩略图，模型走 modelUrl
+  if (id === 'whale3d') return '/dsh-whale/whale-3d-thumb.png'
   return '/dsh-whale/role-image.png?id=' + encodeURIComponent(id)
 }
 function toggleRolePanel() {
@@ -20135,10 +20561,10 @@ function renderRolePanel() {
       // 不会被长名称挤出/撑宽面板
       var nameWrap = document.createElement('span')
       nameWrap.className = 'dshwv-rolenamewrap'
-      if (r.format === 'gif' || r.format === 'apng') {
+      if (r.format === 'gif' || r.format === 'apng' || r.format === 'glb') {
         var gifTag = document.createElement('span')
         gifTag.className = 'dshwv-roleGifTag'
-        gifTag.textContent = r.format === 'apng' ? 'APNG' : 'GIF'
+        gifTag.textContent = r.format === 'glb' ? '3D' : (r.format === 'apng' ? 'APNG' : 'GIF')
         nameWrap.appendChild(gifTag)
       }
       nameWrap.appendChild(name)
@@ -20154,7 +20580,8 @@ function renderRolePanel() {
         togglePin(r.id, !r.pinned)
       })
       item.appendChild(pin)
-      if (r.id !== 'default') {
+      // 内置角色（默认鲸鱼娘 / 内置 3D）既不能删也不能置顶
+      if (r.id !== 'default' && !r.builtin) {
         var del = document.createElement('button')
         del.type = 'button'
         del.className = 'dshwv-roledel'
@@ -20167,7 +20594,7 @@ function renderRolePanel() {
         item.appendChild(del)
       }
       item.addEventListener('click', function () {
-        applyRole(r.id, r.name, roleUrl(r.id))
+        applyRole(r.id, r.name, roleUrl(r.id), r.format, r.modelUrl)
       })
       bindNameMarquee(item, name)
       rolePanel.appendChild(item)
@@ -20545,7 +20972,7 @@ function confirmCrop() {
           for (var i = 0; i < roleList.length; i++) {
             if (roleList[i].id !== 'default' && (!newest || roleList[i].createdAt > newest.createdAt)) newest = roleList[i]
           }
-          if (newest) applyRole(newest.id, newest.name, roleUrl(newest.id))
+          if (newest) applyRole(newest.id, newest.name, roleUrl(newest.id), newest.format, newest.modelUrl)
         }
       })
       .catch(function () {})
@@ -21648,6 +22075,8 @@ function buildHitClipPath() {
   }
 }
 function isWhaleHit(e) {
+  // 3D 角色：轮廓来自渲染帧的凸包，比 2D 命中图更贴合实际画面
+  if (whale3d.active) return dshw3dHit(e)
   // 命中图未就绪/失败时：绝不默认“全屏都是鲸鱼”。
   // 加载中 → 返回 false（不拦截页面）；加载失败 → 退回图像矩形区域，仅挂件区域可拖。
   if (!hitCanvas || !hitReady) {
@@ -21704,6 +22133,8 @@ function onDocPointerDown(e) {
     return
   }
   if (e.button !== 0 && e.pointerType === 'mouse') return
+  // 3D 角色：Alt + 拖拽 = 旋转模型（由 canvas 自己处理），不启动挂件拖拽
+  if (whale3d.active && (e.altKey || whale3d.altDown)) return
   if (!isWhaleHit(e)) return
   try { e.preventDefault(); e.stopPropagation() } catch (err) {}
   var vp = viewport()

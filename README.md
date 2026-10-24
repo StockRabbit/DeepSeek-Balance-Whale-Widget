@@ -36,6 +36,7 @@ DeepSeek Harness（DSH）Web 界面右下角的常驻挂件：小鲸鱼气泡图
 
 - 🖱️ **拖拽 + 吸附**：四边吸附区可自定义（按比例或像素），角落可组合；可关闭吸附自由摆放。**顶部吸附默认值为 0，表示关闭**；想开启请到「菜单 → 吸附与翻转 → 自定义」，选择「比例吸附」或「绝对吸附」，把上侧数值调为正值后点「确认」。上吸附以挂件盒中心进入吸附区为判据，大尺寸挂件需要相应扩大上侧区域；改回 0 可关闭顶部吸附（#152）。
 - 🔄 贴左吸附时整体**水平镜像翻转**（文字同步反向、带动画）
+- 🧊 **3D 角色（可选）**：角色列表里的「小鲸鱼 3D」是实时渲染的 GLB 模型（约 10 万面 / 1MB），**只有切到它时才加载** 733KB 的渲染运行时，PNG 角色用户零开销。拖拽仍是移动挂件，**Alt + 拖拽** = 旋转模型，**Alt + 滚轮** = 缩放视角，**双击** = 复位机位与缩放；透明区穿透沿用凸包裁剪。无 WebGL / 加载失败时自动退回 PNG，不会出现空白方块
 - 🧸 **按压 Q 弹**玩偶效果（按压时底部坐标不变）
 - 🎚️ **主菜单**：角色、大小滑块、**音效与提示**（这行只剩入口按钮「全局设置」，音效总开关已搬进面板）、气泡全局开关 + 「按压泡泡设置」、避让滚动条、吸附设置、隐藏菜单按钮、资源管理（含余额预警、今日预算、小鲸鱼记账）
 - 🔊 **提示与音效设置**（主菜单 → 「音效与提示」→ 「全局设置」）：**四个入口行** —— **按压音效**（音效组、音量）、**每轮消耗提示**（冒泡提示、自动关闭秒数、任务结束音、提示音量）、**提问提示**、**授权提示**。入口行上就是该事件的**总开关**与**当前值摘要**（如 `默认音效组 · 100%`、`自动关 180s · 叮～`），**点一行才展开**该区的设置项（可同时展开多个）。**每个音效都有独立音量**，每行带「试听」；音效行左侧的 `[✓]` 决定该音效**响不响**（不响 = 仍可冒泡）。底栏 `取消 / 恢复默认 / 保存` —— 面板内的改动**只落内存**，点「保存」才生效，点「取消」完整还原（「恢复默认」之后点取消同样能撤销）
@@ -402,6 +403,10 @@ curl http://127.0.0.1:3080/dsh-whale/size.json
 curl http://127.0.0.1:3080/dsh-whale/widget.js
 curl http://127.0.0.1:3080/dsh-whale/image.png
 curl http://127.0.0.1:3080/dsh-whale/audio.json
+curl http://127.0.0.1:3080/dsh-whale/three.js
+curl http://127.0.0.1:3080/dsh-whale/whale-3d.glb
+curl http://127.0.0.1:3080/dsh-whale/whale-3d-thumb.png
+curl "http://127.0.0.1:3080/dsh-whale/role-model.glb?id=<角色 id>"
 ```
 
 - `/dsh-whale/balance.json` → 200 JSON，含 `{ok:true, totalBalance, currency, todayUsage}`
@@ -409,6 +414,10 @@ curl http://127.0.0.1:3080/dsh-whale/audio.json
 - `/dsh-whale/widget.js` → 200 JS（前端挂件本体）
 - `/dsh-whale/image.png` → 200 `image/png`
 - `/dsh-whale/audio.json` → 200，含 `groups` / `fragments`（其中内置片段 `exp_orb` = Minecraft·经验球、`end_a` = A）
+- `/dsh-whale/three.js` → 200 JS：3D 角色运行时（three + GLTFLoader + meshopt 打成的单文件，733KB）。**只有切到 3D 角色时才请求**，PNG 角色用户完全没有这 733KB 的开销
+- `/dsh-whale/whale-3d.glb` → 200 `model/gltf-binary`：内置 3D 角色模型（1028KB，约 10 万面 / 1024 WebP 贴图 / meshopt 几何压缩）
+- `/dsh-whale/whale-3d-thumb.png` → 200 `image/png`：3D 角色在角色列表里的缩略图
+- `/dsh-whale/role-model.glb?id=<角色 id>` → 200 `model/gltf-binary`：自定义 3D 角色（`roles.json` 里 `format:'glb'` 的角色）
 - `/dsh-whale/audio-fragment.wav?id=exp_orb` → 200 `audio/wav`（内置任务结束音；无需用户导入）
 - `/dsh-whale/audio-fragment.wav?id=end_a` → 200 `audio/wav`（内置任务结束音 A）
 - `/dsh-whale/wait.json` → 200 JSON，含 `{ok:true, pending}`；`pending` 为当前挂起的「提问 / 授权」（`{kind:'question'|'approval', id, ts}`）或 `null` —— 这是「提问提示 / 授权提示」音效与常驻气泡的数据源（默认每秒轮询一次）
@@ -416,7 +425,7 @@ curl http://127.0.0.1:3080/dsh-whale/audio.json
 - `/dsh-whale/update-check.json` → 200 JSON：检查更新（`{ok, current, latest, hasUpdate, source}`）；**点了才联网**，镜像优先（npmmirror → jsdelivr → unpkg → npmjs）+ `npm view` 兜底，宿主侧 10 分钟缓存
 - 浏览器 F5 后右下角出现挂件
 
-> ⚠️ **关于上面这些 `curl`**：全部 **26 个** `/dsh-whale/*` 路由都已接入 **DSH 浏览器信任栅栏**（`connection.requestRejection`）。
+> ⚠️ **关于上面这些 `curl`**：全部 **30 个** `/dsh-whale/*` 路由都已接入 **DSH 浏览器信任栅栏**（`connection.requestRejection`）。
 > 因此**不带会话凭据的裸 `curl` 会返回 401**（伪造 `Host` 头则是 403）—— 这是预期行为，不是接口坏了。
 > 想验证接口是否存活，看返回 **401/403** 即说明路由已注册且栅栏在工作；在浏览器里访问同一条路径（带会话）才是 200。
 > 另外**自 0.3.15 起，写请求（`POST`/`PUT`/`PATCH`/`DELETE`）还必须是本机来源**（Host 为 `127.0.0.1`/`localhost`/`[::1]`），否则 403 —— 详见上方「安全边界」。
