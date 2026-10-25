@@ -20109,9 +20109,12 @@ var whale3d = {
   hull: null,
   needRender: true,
   rafing: false,
-  yaw: 0.22, pitch: 0.04,
-  targetYaw: 0.22, targetPitch: 0.04,
-  BASE_YAW: 0.22, BASE_PITCH: 0.04,
+  // 默认机位：挂件常驻右下角，所以让角色**侧身朝左上（页面中心）**，而不是直勾勾盯着屏幕外。
+  // 负角度 = 绕 Y 轴反向转，模型正面转向 -X（左）；贴左吸附时 root 会整体 scaleX(-1)，
+  // 镜像后正好又朝右 —— 两种情况都是"朝向页面内侧"。
+  yaw: -0.38, pitch: 0.04,
+  targetYaw: -0.38, targetPitch: 0.04,
+  BASE_YAW: -0.38, BASE_PITCH: 0.04,
   // Alt + 滚轮缩放视角：只动相机距离，不动挂件尺寸（尺寸仍归「大小」滑块管）
   zoom: 1, targetZoom: 1, baseDist: 0,
   ZOOM_MIN: 0.55, ZOOM_MAX: 1.6,
