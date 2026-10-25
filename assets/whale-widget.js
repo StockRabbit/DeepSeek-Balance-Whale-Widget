@@ -20174,9 +20174,13 @@ function dshw3dStop() {
 function dshw3dResize() {
   if (!whale3d.active || !whale3d.renderer || !whale3d.camera) return
   try {
-    var r = img.getBoundingClientRect()
-    var w = Math.max(1, Math.round(r.width))
-    var h = Math.max(1, Math.round(r.height))
+    // ⚠️ 必须用 offsetWidth/offsetHeight（布局尺寸），**不能**用 getBoundingClientRect：
+    //   后者包含 transform —— 按压缩放会给 .dshwv-body 套 scaleY(.88) scaleX(1.05)，
+    //   连续点击时 ResizeObserver 会按"被压扁的矩形"去 setSize + 改 camera.aspect；
+    //   松手后若最后一次回调没赶上（transition 结束与 observer 节流存在竞争），
+    //   渲染器就永久停在 0.88 倍的尺寸上 —— 也就是用户看到的"点几下模型就变小了"。
+    var w = Math.max(1, Math.round(img.offsetWidth))
+    var h = Math.max(1, Math.round(img.offsetHeight))
     var dpr = Math.min(window.devicePixelRatio || 1, 2)
     whale3d.renderer.setPixelRatio(dpr)
     whale3d.renderer.setSize(w, h, false)
@@ -20368,13 +20372,15 @@ function bindWhale3dPointer(c) {
     dshw3dKick()
   }, { passive: false })
 
-  // 双击复位（机位 + 缩放一起回默认；不动挂件位置）
+  // 双击复位机位。**缩放不跟着复位** —— 用户连点角色（想压实/出泡泡）很容易被浏览器
+  // 判成 dblclick，如果这里顺手把 zoom 拉回 1，表现就是"点几下模型的大小就重置了"。
+  // 想要连缩放一起复位，用 Alt + 双击（与 Alt 系列的其它手势保持一致）。
   c.addEventListener('dblclick', function (e) {
     if (!whale3d.active) return
     try { e.preventDefault(); e.stopPropagation() } catch (err) {}
     whale3d.targetYaw = whale3d.BASE_YAW
     whale3d.targetPitch = whale3d.BASE_PITCH
-    whale3d.targetZoom = 1
+    if (e.altKey || whale3d.altDown) whale3d.targetZoom = 1
     whale3d.needRender = true
     dshw3dKick()
   })
