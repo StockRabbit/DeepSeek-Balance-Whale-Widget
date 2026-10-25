@@ -20119,6 +20119,21 @@ var whale3d = {
   zoom: 1, targetZoom: 1, baseDist: 0,
   ZOOM_MIN: 0.55, ZOOM_MAX: 1.6,
   altDown: false,
+  // —— 待机"活物感" ——
+  // 呼吸（起伏）+ 微摆（左右）+ 浮动（上下）+ 随机小动作（偶尔歪一下头）+ 视线跟随鼠标。
+  // 全部是 holder 上的程序化变换，不需要骨骼/动画剪辑，所以对现有 GLB 零改动。
+  idle: true,
+  idleFps: 30,        // 待机 30fps：肉眼足够平滑，GPU 占用只有 60fps 的一半
+  windowFocused: true,
+  lastFrameAt: 0,
+  lookYaw: 0, lookPitch: 0,
+  targetLookYaw: 0, targetLookPitch: 0,
+  // 用户手动转视角的时间点：4 秒内不抢镜头。
+  // ⚠️ 初值必须是"很久以前"，不能是 0 —— performance.now() 从页面导航开始算，
+  //   写成 0 会让**刚启动的前 4 秒**被误判成"用户刚操作过"，视线跟随一上来就哑火。
+  lastManualAt: -1e9,
+  nextTwitchAt: 0,
+  twitch: null,
   drag: null,
   lastHitAt: 0,
   hitCanvas: null,
@@ -20197,10 +20212,20 @@ function dshw3dKick() {
   try { requestAnimationFrame(dshw3dFrame) } catch (err) { whale3d.rafing = false }
 }
 
-function dshw3dFrame() {
+function dshw3dFrame(ts) {
   whale3d.rafing = false
   if (!whale3d.active || !whale3d.renderer) return
   if (document.hidden) return
+
+  var now = typeof ts === 'number' ? ts : performance.now()
+  // 待机时按 idleFps 限帧；有交互（needRender）时立刻画，不做节流
+  var idleOn = whale3d.idle && whale3d.windowFocused
+  if (!whale3d.needRender && idleOn) {
+    if (now - whale3d.lastFrameAt < (1000 / whale3d.idleFps) - 1.5) { dshw3dKick(); return }
+  }
+  whale3d.lastFrameAt = now
+
+  var t = now / 1000
   var moving = false
   try {
     var dy = whale3d.targetYaw - whale3d.yaw
@@ -20210,10 +20235,14 @@ function dshw3dFrame() {
       whale3d.pitch += dp * 0.2
       moving = true
     }
-    if (whale3d.holder) {
-      whale3d.holder.rotation.y = whale3d.yaw
-      whale3d.holder.rotation.x = whale3d.pitch
-    }
+
+    // 视线跟随：手动转过视角后 4 秒内不抢镜头，之后慢慢转回看鼠标
+    var canLook = whale3d.idle && (now - whale3d.lastManualAt > 4000)
+    var lty = canLook ? whale3d.targetLookYaw : 0
+    var ltp = canLook ? whale3d.targetLookPitch : 0
+    whale3d.lookYaw += (lty - whale3d.lookYaw) * 0.10
+    whale3d.lookPitch += (ltp - whale3d.lookPitch) * 0.10
+
     var dz = whale3d.targetZoom - whale3d.zoom
     if (Math.abs(dz) > 1e-4) {
       whale3d.zoom += dz * 0.22
@@ -20225,16 +20254,52 @@ function dshw3dFrame() {
         whale3d.camera.lookAt(0, 0.86 * 0.5, 0)
       }
     }
+
+    // —— 待机微动 ——
+    // 三个不同频率的正弦叠加（0.41Hz / 0.21Hz / 0.31Hz），周期互不整除，
+    // 所以看不出"循环感" —— 这是让程序化动画不呆板的关键。
+    var breath = 0, sway = 0, bob = 0, twz = 0
+    if (whale3d.idle) {
+      breath = Math.sin(t * 2.6) * 0.011
+      sway = Math.sin(t * 1.35) * 0.010
+      bob = Math.sin(t * 1.95) * 0.006
+
+      // 随机小动作：每 7~19 秒歪一下头，避免只是一个匀速呼吸的"模型"
+      if (!whale3d.twitch && now > whale3d.nextTwitchAt) {
+        whale3d.twitch = {
+          t0: now,
+          dur: 780 + Math.random() * 420,
+          amp: (Math.random() < 0.5 ? -1 : 1) * (0.035 + Math.random() * 0.03)
+        }
+        whale3d.nextTwitchAt = now + 7000 + Math.random() * 12000
+      }
+      if (whale3d.twitch) {
+        var p = (now - whale3d.twitch.t0) / whale3d.twitch.dur
+        if (p >= 1) whale3d.twitch = null
+        else twz = whale3d.twitch.amp * Math.sin(p * Math.PI) // 0→最大→0 的平滑包络
+      }
+      if (!whale3d.nextTwitchAt) whale3d.nextTwitchAt = now + 4000
+    }
+
+    if (whale3d.holder) {
+      whale3d.holder.rotation.y = whale3d.yaw + whale3d.lookYaw
+      whale3d.holder.rotation.x = whale3d.pitch + whale3d.lookPitch
+      whale3d.holder.rotation.z = sway + twz
+      whale3d.holder.position.y = bob
+      // 呼吸只放大 Y、按比例收 X/Z（体积守恒），否则会像"整体缩放"
+      whale3d.holder.scale.set(1 - breath * 0.45, 1 + breath, 1 - breath * 0.45)
+    }
   } catch (err) {}
-  if (!whale3d.needRender && !moving) return
+
+  if (!whale3d.needRender && !moving && !idleOn) return
   whale3d.needRender = false
   try {
     whale3d.renderer.render(whale3d.scene, whale3d.camera)
-    var now = performance.now()
-    // 凸包重算要读回整帧像素（1~3ms），拖拽中限流到 200ms 一次足够
-    if (now - whale3d.lastHitAt > 200) { whale3d.lastHitAt = now; dshw3dBuildHull() }
+    // 凸包重算要读回整帧像素（1~3ms）：拖拽中 200ms 一次，待机轮廓几乎不变，放宽容差
+    var gap = whale3d.drag ? 200 : 900
+    if (now - whale3d.lastHitAt > gap) { whale3d.lastHitAt = now; dshw3dBuildHull() }
   } catch (err) {}
-  if (moving) dshw3dKick()
+  dshw3dKick()
 }
 
 function dshw3dBuildHull() {
@@ -20337,6 +20402,7 @@ function bindWhale3dPointer(c) {
       x: e.clientX, y: e.clientY,
       yaw: whale3d.targetYaw, pitch: whale3d.targetPitch
     }
+    whale3d.lastManualAt = performance.now() // 4 秒内别用视线跟随抢镜头
     c.style.cursor = 'grabbing'
   })
   c.addEventListener('pointermove', function (e) {
@@ -20368,6 +20434,7 @@ function bindWhale3dPointer(c) {
     if (!d) return
     var next = whale3d.targetZoom * Math.exp(-d * 0.0015)
     whale3d.targetZoom = Math.max(whale3d.ZOOM_MIN, Math.min(whale3d.ZOOM_MAX, next))
+    whale3d.lastManualAt = performance.now()
     whale3d.needRender = true
     dshw3dKick()
   }, { passive: false })
@@ -20381,6 +20448,7 @@ function bindWhale3dPointer(c) {
     whale3d.targetYaw = whale3d.BASE_YAW
     whale3d.targetPitch = whale3d.BASE_PITCH
     if (e.altKey || whale3d.altDown) whale3d.targetZoom = 1
+    whale3d.lastManualAt = performance.now()
     whale3d.needRender = true
     dshw3dKick()
   })
@@ -20473,6 +20541,10 @@ function dshw3dBoot(c, modelUrl) {
         var dist = (0.86 * 0.5) / Math.tan(28 * Math.PI / 360) * 0.98
         whale3d.baseDist = dist
         whale3d.zoom = whale3d.targetZoom = 1
+        // 待机相关状态复位：视线回正、第一下小动作别一上来就触发
+        whale3d.lookYaw = whale3d.lookPitch = 0
+        whale3d.targetLookYaw = whale3d.targetLookPitch = 0
+        whale3d.nextTwitchAt = performance.now() + 4000
         whale3d.camera.position.set(0, 0.86 * 0.52, dist)
         whale3d.camera.lookAt(0, 0.86 * 0.5, 0)
         whale3d.active = true
@@ -20484,6 +20556,42 @@ function dshw3dBoot(c, modelUrl) {
     }, undefined, function () { dshw3dStop() })
   } catch (err) { dshw3dStop() }
 }
+
+// —— 待机动画的两个输入源：鼠标位置（视线跟随）+ 窗口焦点（省电）——
+// 指针监听挂 document 且 passive：挂件是常驻的，不能因为"跟随鼠标"把页面的滚动/点击拖慢。
+try {
+  var dshw3dLastLook = 0
+  document.addEventListener('pointermove', function (e) {
+    if (!whale3d.active || !whale3d.idle) return
+    var now = performance.now()
+    if (now - dshw3dLastLook < 80) return
+    dshw3dLastLook = now
+    try {
+      var r = img.getBoundingClientRect()
+      if (!r.width || !r.height) return
+      // 以角色胸口为原点，把鼠标位置归一化到 ±1，再压到 ±0.22rad（约 12.6°）
+      var cx = r.left + r.width / 2
+      var cy = r.top + r.height * 0.42
+      var nx = (e.clientX - cx) / Math.max(1, window.innerWidth * 0.45)
+      var ny = (e.clientY - cy) / Math.max(1, window.innerHeight * 0.45)
+      whale3d.targetLookYaw = Math.max(-0.22, Math.min(0.22, nx * 0.22))
+      whale3d.targetLookPitch = Math.max(-0.10, Math.min(0.10, ny * 0.10))
+    } catch (err) {}
+  }, { passive: true })
+  // 鼠标移出页面：视线回正
+  document.addEventListener('mouseleave', function () {
+    whale3d.targetLookYaw = 0
+    whale3d.targetLookPitch = 0
+  })
+} catch (err) {}
+
+try {
+  window.addEventListener('focus', function () {
+    whale3d.windowFocused = true
+    if (whale3d.active) { whale3d.needRender = true; dshw3dKick() }
+  })
+  window.addEventListener('blur', function () { whale3d.windowFocused = false })
+} catch (err) {}
 
 // 调试出口（和 window.__dshWhaleRoot 同性质）：用于排查"3D 没出现"这类现场问题
 try { window.__dshWhale3d = whale3d } catch (err) {}
